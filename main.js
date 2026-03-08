@@ -32,9 +32,9 @@ const PUBMED_CACHE_KEY = 'review_platform_pubmed_cache';
 const DROPBOX_STORAGE_KEY = 'review_platform_dropbox';
 
 // ============================================================
-// DROPBOX API (OAuth PKCE — same app as research-tracker)
+// DROPBOX API (OAuth PKCE)
 // ============================================================
-const DROPBOX_APP_KEY = 'fo1pvqd9l39pef4';
+const DROPBOX_APP_KEY = 'qdee3qtbgwyskx3';
 const DROPBOX_TOKEN_URL = 'https://api.dropboxapi.com/oauth2/token';
 const DROPBOX_UPLOAD_URL = 'https://content.dropboxapi.com/2/files/upload';
 const DROPBOX_DOWNLOAD_URL = 'https://content.dropboxapi.com/2/files/download';
