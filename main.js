@@ -484,8 +484,8 @@ function renderApp() {
           <div class="stat-pill"><span class="dot pending"></span>${globalStats.pending} pending</div>
         </div>
         <div class="actions">
-          <button class="btn btn-sm" id="btn-pull" title="Pull latest data from review-queue.csv">⬆ Pull</button>
-          <button class="btn btn-sm btn-primary" id="btn-push" title="Push decisions back to review-queue.csv">⬇ Push</button>
+          <button class="btn btn-sm" id="btn-pull" title="Pull latest data from review-queue.csv">⬇ Pull</button>
+          <button class="btn btn-sm btn-primary" id="btn-push" title="Push decisions back to review-queue.csv">⬆ Push</button>
         </div>
       </div>
 
@@ -1800,6 +1800,8 @@ function handleKeyboard(e) {
 // ============================================================
 // PUSH / PULL
 // ============================================================
+const isLocal = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
+
 async function handlePush() {
   const btn = document.getElementById('btn-push');
   if (btn) { btn.textContent = '⏳ Pushing...'; btn.disabled = true; }
@@ -1821,22 +1823,35 @@ async function handlePush() {
     });
 
     const csv = Papa.unparse(rows);
-    const res = await fetch('/api/push', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ csv }),
-    });
-    const data = await res.json();
 
-    if (data.ok) {
-      showToast(`✓ Pushed ${Object.keys(state.decisions).length} decisions to review-queue.csv`);
+    if (isLocal) {
+      // Local dev: push to server API
+      const res = await fetch('/api/push', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ csv }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        showToast(`✓ Pushed ${Object.keys(state.decisions).length} decisions to review-queue.csv`);
+      } else {
+        showToast(`Push failed: ${data.error}`, true);
+      }
     } else {
-      showToast(`Push failed: ${data.error}`, true);
+      // Vercel/remote: download as CSV file
+      const blob = new Blob([csv], { type: 'text/csv' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'review-queue-reviewed.csv';
+      a.click();
+      URL.revokeObjectURL(url);
+      showToast(`⬇ Downloaded reviewed CSV (${Object.keys(state.decisions).length} decisions)`);
     }
   } catch (err) {
     showToast(`Push error: ${err.message}`, true);
   } finally {
-    if (btn) { btn.textContent = '⬇ Push'; btn.disabled = false; }
+    if (btn) { btn.textContent = '⬆ Push'; btn.disabled = false; }
   }
 }
 
@@ -1845,11 +1860,31 @@ async function handlePull() {
   if (btn) { btn.textContent = '⏳ Pulling...'; btn.disabled = true; }
 
   try {
-    const res = await fetch('/api/pull');
-    const data = await res.json();
+    let csvText = null;
 
-    if (data.ok && data.csv) {
-      parseCSV(data.csv);
+    if (isLocal) {
+      // Local dev: pull from server API
+      const res = await fetch('/api/pull');
+      const data = await res.json();
+      if (data.ok && data.csv) {
+        csvText = data.csv;
+      } else {
+        showToast(`Pull failed: ${data.error}`, true);
+        return;
+      }
+    } else {
+      // Vercel/remote: reload from static CSV
+      const res = await fetch('/data/review-queue.csv');
+      if (res.ok) {
+        csvText = await res.text();
+      } else {
+        showToast('Could not fetch data file', true);
+        return;
+      }
+    }
+
+    if (csvText) {
+      parseCSV(csvText);
 
       // Restore existing decisions from the CSV's reviewer_decision column
       let imported = 0;
@@ -1874,13 +1909,11 @@ async function handlePull() {
       }
       renderApp();
       showToast(`✓ Pulled ${state.rawData.length} rows${imported > 0 ? `, imported ${imported} decisions` : ''}`);
-    } else {
-      showToast(`Pull failed: ${data.error}`, true);
     }
   } catch (err) {
     showToast(`Pull error: ${err.message}`, true);
   } finally {
-    if (btn) { btn.textContent = '⬆ Pull'; btn.disabled = false; }
+    if (btn) { btn.textContent = '⬇ Pull'; btn.disabled = false; }
   }
 }
 
