@@ -330,6 +330,21 @@ body::before {
   padding: 0.35rem 0.7rem;
 }
 
+.btn-dropbox {
+  border-color: #0061fe;
+  color: #4d9aff;
+}
+
+.btn-dropbox:hover {
+  background: rgba(0, 97, 254, 0.12);
+}
+
+.btn-dropbox.connected {
+  border-color: var(--accent-green);
+  color: var(--accent-green);
+  background: var(--accent-green-dim);
+}
+
 /* ---- Sidebar ---- */
 .sidebar {
   background: var(--bg-surface);

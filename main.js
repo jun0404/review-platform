@@ -29,6 +29,190 @@ const state = {
 // ---- Persistence ----
 const STORAGE_KEY = 'review_platform_decisions_v2';
 const PUBMED_CACHE_KEY = 'review_platform_pubmed_cache';
+const DROPBOX_STORAGE_KEY = 'review_platform_dropbox';
+
+// ============================================================
+// DROPBOX API (OAuth PKCE — same app as research-tracker)
+// ============================================================
+const DROPBOX_APP_KEY = 'fo1pvqd9l39pef4';
+const DROPBOX_TOKEN_URL = 'https://api.dropboxapi.com/oauth2/token';
+const DROPBOX_UPLOAD_URL = 'https://content.dropboxapi.com/2/files/upload';
+const DROPBOX_DOWNLOAD_URL = 'https://content.dropboxapi.com/2/files/download';
+const DROPBOX_CSV_PATH = '/Research/202602 OS NEW2 Sarcopenia/meta/08-human-review/review-queue.csv';
+
+let dropboxTokens = null; // { access_token, refresh_token, expires_at }
+
+function loadDropboxTokens() {
+  try {
+    const saved = localStorage.getItem(DROPBOX_STORAGE_KEY);
+    if (saved) dropboxTokens = JSON.parse(saved);
+  } catch { /* ignore */ }
+}
+
+function saveDropboxTokens() {
+  try {
+    if (dropboxTokens) {
+      localStorage.setItem(DROPBOX_STORAGE_KEY, JSON.stringify(dropboxTokens));
+    } else {
+      localStorage.removeItem(DROPBOX_STORAGE_KEY);
+    }
+  } catch { /* ignore */ }
+}
+
+function isDropboxConnected() {
+  return dropboxTokens && dropboxTokens.access_token;
+}
+
+// PKCE helpers
+function generateCodeVerifier() {
+  const arr = new Uint8Array(32);
+  crypto.getRandomValues(arr);
+  return Array.from(arr, b => b.toString(36).padStart(2, '0')).join('').slice(0, 128);
+}
+
+async function sha256(plain) {
+  return crypto.subtle.digest('SHA-256', new TextEncoder().encode(plain));
+}
+
+function base64url(buf) {
+  const bytes = new Uint8Array(buf);
+  let str = '';
+  bytes.forEach(b => (str += String.fromCharCode(b)));
+  return btoa(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+async function startDropboxOAuth() {
+  const verifier = generateCodeVerifier();
+  sessionStorage.setItem('dropbox_code_verifier', verifier);
+  const challenge = base64url(await sha256(verifier));
+  const redirectUri = window.location.origin + window.location.pathname;
+  const params = new URLSearchParams({
+    client_id: DROPBOX_APP_KEY,
+    response_type: 'code',
+    code_challenge: challenge,
+    code_challenge_method: 'S256',
+    redirect_uri: redirectUri,
+    token_access_type: 'offline',
+  });
+  window.location.href = `https://www.dropbox.com/oauth2/authorize?${params}`;
+}
+
+async function exchangeDropboxCode(code) {
+  const verifier = sessionStorage.getItem('dropbox_code_verifier') || '';
+  sessionStorage.removeItem('dropbox_code_verifier');
+  const redirectUri = window.location.origin + window.location.pathname;
+  const res = await fetch(DROPBOX_TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      code,
+      grant_type: 'authorization_code',
+      client_id: DROPBOX_APP_KEY,
+      redirect_uri: redirectUri,
+      code_verifier: verifier,
+    }),
+  });
+  if (!res.ok) throw new Error(`Token exchange failed: ${res.status}`);
+  const data = await res.json();
+  dropboxTokens = {
+    access_token: data.access_token,
+    refresh_token: data.refresh_token,
+    expires_at: Date.now() + (data.expires_in * 1000) - 60000,
+  };
+  saveDropboxTokens();
+}
+
+async function refreshDropboxToken() {
+  if (!dropboxTokens?.refresh_token) return false;
+  try {
+    const res = await fetch(DROPBOX_TOKEN_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'refresh_token',
+        refresh_token: dropboxTokens.refresh_token,
+        client_id: DROPBOX_APP_KEY,
+      }),
+    });
+    if (!res.ok) return false;
+    const data = await res.json();
+    dropboxTokens.access_token = data.access_token;
+    dropboxTokens.expires_at = Date.now() + (data.expires_in * 1000) - 60000;
+    saveDropboxTokens();
+    return true;
+  } catch { return false; }
+}
+
+async function getValidToken() {
+  if (!dropboxTokens) return null;
+  if (Date.now() > (dropboxTokens.expires_at || 0)) {
+    const ok = await refreshDropboxToken();
+    if (!ok) {
+      dropboxTokens = null;
+      saveDropboxTokens();
+      showToast('Dropbox session expired. Please reconnect.', true);
+      return null;
+    }
+  }
+  return dropboxTokens.access_token;
+}
+
+async function dropboxUpload(csvText) {
+  const token = await getValidToken();
+  if (!token) throw new Error('Not connected to Dropbox');
+  const res = await fetch(DROPBOX_UPLOAD_URL, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/octet-stream',
+      'Dropbox-API-Arg': JSON.stringify({
+        path: DROPBOX_CSV_PATH,
+        mode: 'overwrite',
+        autorename: false,
+        mute: true,
+      }),
+    },
+    body: csvText,
+  });
+  if (!res.ok) throw new Error(`Dropbox upload failed: ${res.status}`);
+}
+
+async function dropboxDownload() {
+  const token = await getValidToken();
+  if (!token) throw new Error('Not connected to Dropbox');
+  const res = await fetch(DROPBOX_DOWNLOAD_URL, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Dropbox-API-Arg': JSON.stringify({ path: DROPBOX_CSV_PATH }),
+    },
+  });
+  if (!res.ok) throw new Error(`Dropbox download failed: ${res.status}`);
+  return res.text();
+}
+
+function disconnectDropbox() {
+  dropboxTokens = null;
+  saveDropboxTokens();
+  showToast('Disconnected from Dropbox');
+}
+
+// Handle OAuth callback on page load
+async function handleDropboxCallback() {
+  const params = new URLSearchParams(window.location.search);
+  const code = params.get('code');
+  if (code && sessionStorage.getItem('dropbox_code_verifier')) {
+    try {
+      await exchangeDropboxCode(code);
+      // Clean URL
+      window.history.replaceState({}, '', window.location.pathname);
+      showToast('✓ Connected to Dropbox!');
+    } catch (err) {
+      console.error('Dropbox auth failed:', err);
+      showToast('Dropbox auth failed: ' + err.message, true);
+    }
+  }
+}
 
 function loadDecisions() {
   try {
@@ -484,8 +668,11 @@ function renderApp() {
           <div class="stat-pill"><span class="dot pending"></span>${globalStats.pending} pending</div>
         </div>
         <div class="actions">
-          <button class="btn btn-sm" id="btn-pull" title="Pull latest data from review-queue.csv">⬇ Pull</button>
-          <button class="btn btn-sm btn-primary" id="btn-push" title="Push decisions back to review-queue.csv">⬆ Push</button>
+          <button class="btn btn-sm" id="btn-pull" title="Pull latest data">⬇ Pull</button>
+          <button class="btn btn-sm btn-primary" id="btn-push" title="Push decisions">⬆ Push</button>
+          ${isDropboxConnected()
+            ? '<button class="btn btn-sm btn-dropbox connected" id="btn-dropbox" title="Connected to Dropbox">📦 Dropbox ✓</button>'
+            : '<button class="btn btn-sm btn-dropbox" id="btn-dropbox" title="Connect to Dropbox for cloud sync">📦 Dropbox</button>'}
         </div>
       </div>
 
@@ -1186,9 +1373,19 @@ function bindAppEvents() {
     mainContent.addEventListener('click', handleValueBoxClick);
   }
 
-  // Push / Pull
+  // Push / Pull / Dropbox
   document.getElementById('btn-push')?.addEventListener('click', handlePush);
   document.getElementById('btn-pull')?.addEventListener('click', handlePull);
+  document.getElementById('btn-dropbox')?.addEventListener('click', () => {
+    if (isDropboxConnected()) {
+      if (confirm('Disconnect from Dropbox?')) {
+        disconnectDropbox();
+        renderApp();
+      }
+    } else {
+      startDropboxOAuth();
+    }
+  });
 
   // PubMed
   document.getElementById('btn-pubmed')?.addEventListener('click', handlePubmedLookup);
@@ -1802,30 +1999,57 @@ function handleKeyboard(e) {
 // ============================================================
 const isLocal = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
 
+function buildMergedCSV() {
+  const rows = state.rawData.map((row, idx) => {
+    const result = { ...row };
+    for (const [key, decision] of Object.entries(state.decisions)) {
+      const [, origIdx] = key.split('::');
+      if (parseInt(origIdx) === idx) {
+        result.reviewer_decision = decision.decision;
+        result.corrected_value = decision.correctedValue || '';
+        break;
+      }
+    }
+    delete result._originalIndex;
+    return result;
+  });
+  return Papa.unparse(rows);
+}
+
+function importDecisionsFromCSV() {
+  let imported = 0;
+  state.rawData.forEach((row, idx) => {
+    if (row.reviewer_decision && row.reviewer_decision.trim()) {
+      const key = getDecisionKey(row.study_id, idx);
+      if (!state.decisions[key]) {
+        state.decisions[key] = {
+          decision: row.reviewer_decision.trim(),
+          correctedValue: row.corrected_value || null,
+          timestamp: new Date().toISOString(),
+          imported: true,
+        };
+        imported++;
+      }
+    }
+  });
+  if (imported > 0) saveDecisions();
+  return imported;
+}
+
 async function handlePush() {
   const btn = document.getElementById('btn-push');
   if (btn) { btn.textContent = '⏳ Pushing...'; btn.disabled = true; }
 
   try {
-    // Build merged CSV with decisions
-    const rows = state.rawData.map((row, idx) => {
-      const result = { ...row };
-      for (const [key, decision] of Object.entries(state.decisions)) {
-        const [, origIdx] = key.split('::');
-        if (parseInt(origIdx) === idx) {
-          result.reviewer_decision = decision.decision;
-          result.corrected_value = decision.correctedValue || '';
-          break;
-        }
-      }
-      delete result._originalIndex;
-      return result;
-    });
+    const csv = buildMergedCSV();
+    const decisionCount = Object.keys(state.decisions).length;
 
-    const csv = Papa.unparse(rows);
-
-    if (isLocal) {
-      // Local dev: push to server API
+    if (isDropboxConnected()) {
+      // Dropbox push
+      await dropboxUpload(csv);
+      showToast(`✓ Pushed ${decisionCount} decisions to Dropbox`);
+    } else if (isLocal) {
+      // Local dev API
       const res = await fetch('/api/push', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1833,12 +2057,12 @@ async function handlePush() {
       });
       const data = await res.json();
       if (data.ok) {
-        showToast(`✓ Pushed ${Object.keys(state.decisions).length} decisions to review-queue.csv`);
+        showToast(`✓ Pushed ${decisionCount} decisions to review-queue.csv`);
       } else {
         showToast(`Push failed: ${data.error}`, true);
       }
     } else {
-      // Vercel/remote: download as CSV file
+      // Fallback: download
       const blob = new Blob([csv], { type: 'text/csv' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -1846,7 +2070,7 @@ async function handlePush() {
       a.download = 'review-queue-reviewed.csv';
       a.click();
       URL.revokeObjectURL(url);
-      showToast(`⬇ Downloaded reviewed CSV (${Object.keys(state.decisions).length} decisions)`);
+      showToast(`⬇ Downloaded reviewed CSV (${decisionCount} decisions)`);
     }
   } catch (err) {
     showToast(`Push error: ${err.message}`, true);
@@ -1862,8 +2086,11 @@ async function handlePull() {
   try {
     let csvText = null;
 
-    if (isLocal) {
-      // Local dev: pull from server API
+    if (isDropboxConnected()) {
+      // Dropbox pull
+      csvText = await dropboxDownload();
+    } else if (isLocal) {
+      // Local dev API
       const res = await fetch('/api/pull');
       const data = await res.json();
       if (data.ok && data.csv) {
@@ -1873,7 +2100,7 @@ async function handlePull() {
         return;
       }
     } else {
-      // Vercel/remote: reload from static CSV
+      // Fallback: reload static
       const res = await fetch('/data/review-queue.csv');
       if (res.ok) {
         csvText = await res.text();
@@ -1885,30 +2112,13 @@ async function handlePull() {
 
     if (csvText) {
       parseCSV(csvText);
-
-      // Restore existing decisions from the CSV's reviewer_decision column
-      let imported = 0;
-      state.rawData.forEach((row, idx) => {
-        if (row.reviewer_decision && row.reviewer_decision.trim()) {
-          const key = getDecisionKey(row.study_id, idx);
-          if (!state.decisions[key]) {
-            state.decisions[key] = {
-              decision: row.reviewer_decision.trim(),
-              correctedValue: row.corrected_value || null,
-              timestamp: new Date().toISOString(),
-              imported: true,
-            };
-            imported++;
-          }
-        }
-      });
-      if (imported > 0) saveDecisions();
-
+      const imported = importDecisionsFromCSV();
       if (state.studies.length > 0 && !state.studies.includes(state.activeStudy)) {
         state.activeStudy = state.studies[0];
       }
       renderApp();
-      showToast(`✓ Pulled ${state.rawData.length} rows${imported > 0 ? `, imported ${imported} decisions` : ''}`);
+      const source = isDropboxConnected() ? 'Dropbox' : 'server';
+      showToast(`✓ Pulled ${state.rawData.length} rows from ${source}${imported > 0 ? `, imported ${imported} decisions` : ''}`);
     }
   } catch (err) {
     showToast(`Pull error: ${err.message}`, true);
@@ -1940,9 +2150,13 @@ async function tryAutoLoad() {
 // INIT
 // ============================================================
 loadDecisions();
+loadDropboxTokens();
 
-tryAutoLoad().then(loaded => {
-  if (!loaded) {
-    renderUploadScreen();
-  }
+// Handle Dropbox OAuth callback, then auto-load
+handleDropboxCallback().then(() => {
+  tryAutoLoad().then(loaded => {
+    if (!loaded) {
+      renderUploadScreen();
+    }
+  });
 });
